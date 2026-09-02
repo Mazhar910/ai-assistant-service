@@ -63,11 +63,29 @@ public class CryptoFilter implements Filter {
         HttpServletRequest httpReq = (HttpServletRequest) request;
         HttpServletResponse httpResp = (HttpServletResponse) response;
 
+        // Application-layer crypto only applies to the initial REQUEST. Async/error
+        // re-dispatches (e.g. the async dispatch that drives SSE completion, or the
+        // error dispatch) must never be re-encrypted or re-validated.
+        if (httpReq.getDispatcherType() != jakarta.servlet.DispatcherType.REQUEST) {
+            chain.doFilter(request, response);
+            return;
+        }
+
         String path = httpReq.getServletPath();
+        // Only the SSE job-status stream is exempt: an open-ended push channel that
+        // cannot be buffered into a single encrypted JSON envelope. Match the exact
+        // endpoint shape (/api/agent/jobs/{jobId}/stream) rather than any path suffix so
+        // a future endpoint ending in "/stream" does not silently bypass crypto.
+        boolean streamPath = path != null && path.matches("/api/agent/jobs/[^/]+/stream");
         if (HttpMethod.OPTIONS.matches(httpReq.getMethod())
                 || path == null
                 || path.startsWith("/api/crypto")
-                || path.startsWith("/h2-console")) {
+                || path.startsWith("/h2-console")
+                || streamPath) {
+            // SSE streams are open-ended push channels: they cannot be buffered into a
+            // single encrypted JSON envelope (the response must stream incrementally with
+            // a text/event-stream content type), so they are exempt from this filter and
+            // are authenticated via the standard JWT Authorization header (JwtAuthFilter).
             chain.doFilter(request, response);
             return;
         }
