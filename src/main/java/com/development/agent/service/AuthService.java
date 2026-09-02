@@ -5,12 +5,14 @@ import com.development.agent.dto.AuthResponse;
 import com.development.agent.dto.LoginRequest;
 import com.development.agent.dto.RegisterRequest;
 import com.development.agent.entity.User;
+import com.development.agent.exception.AiAgentException;
 import com.development.agent.repository.UserRepository;
 import com.development.agent.security.JwtUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class AuthService {
@@ -30,12 +32,23 @@ public class AuthService {
         this.userCache = userCache;
     }
 
+    /**
+     * Registers a regular user. Admins are ONLY provisioned through the explicit
+     * {@code ADMIN_PASSWORD} bootstrap in {@code DataInitializer} - the public
+     * registration endpoint never grants the ADMIN role.
+     *
+     * @Transactional: the existence checks, user create and token-issue/active-token
+     * update commit as one unit. A concurrent duplicate register races to the unique
+     * constraints instead, surfacing as a {@code DataIntegrityViolationException}
+     * (mapped to HTTP 409 by {@code GlobalExceptionHandler}).
+     */
+    @Transactional
     public AuthResponse register(RegisterRequest request) {
         if (userRepository.existsByUsername(request.getUsername())) {
-            return AuthResponse.error("Username already taken");
+            throw new AiAgentException("Username already taken", "USERNAME_TAKEN", 409);
         }
         if (userRepository.existsByEmail(request.getEmail())) {
-            return AuthResponse.error("Email already registered");
+            throw new AiAgentException("Email already registered", "EMAIL_TAKEN", 409);
         }
 
         User user = new User(
@@ -44,21 +57,18 @@ public class AuthService {
                 passwordEncoder.encode(request.getPassword())
         );
 
-        // First user becomes admin
-        if (userRepository.count() == 0) {
-            user.setRole("ADMIN");
-            log.info("First user '{}' registered as ADMIN", request.getUsername());
-        }
-
+        // Persist first so the user has a real ID, then issue the token,
+        // then save again to store the activeToken. Generating the token before
+        // save produced a "null" subject (user.getId() was null) and broke the
+        // first authenticated request after signup.
         user = userRepository.save(user);
-
-        String token = jwtUtil.generateToken(user.getId(), user.getUsername(), user.getRole());
+        String token = jwtUtil.generateToken(user.getId(), user.getUsername(), user.getRole().name());
         user.setActiveToken(token);
         userRepository.save(user);
         userCache.invalidate(user.getId());
 
         log.info("User '{}' registered successfully with role '{}'", user.getUsername(), user.getRole());
-        return AuthResponse.success(token, user.getUsername(), user.getRole());
+        return AuthResponse.success(token, user.getUsername(), user.getRole().name());
     }
 
     public AuthResponse login(LoginRequest request) {
@@ -66,22 +76,22 @@ public class AuthService {
                 .orElse(null);
 
         if (user == null || !passwordEncoder.matches(request.getPassword(), user.getPassword())) {
-            return AuthResponse.error("Invalid username or password");
+            throw new AiAgentException("Invalid username or password", "INVALID_CREDENTIALS", 401);
         }
 
         if (!user.isEnabled()) {
-            return AuthResponse.error("Account has been disabled by admin");
+            throw new AiAgentException("Account has been disabled by admin", "ACCOUNT_DISABLED", 403);
         }
 
         // Single session: invalidate previous token
-        String newToken = jwtUtil.generateToken(user.getId(), user.getUsername(), user.getRole());
+        String newToken = jwtUtil.generateToken(user.getId(), user.getUsername(), user.getRole().name());
         user.setActiveToken(newToken);
         userRepository.save(user);
         // Refresh cached user so the new activeToken is honored immediately
         userCache.put(user.getId(), user);
 
         log.info("User '{}' logged in successfully (single session enforced)", user.getUsername());
-        return AuthResponse.success(newToken, user.getUsername(), user.getRole());
+        return AuthResponse.success(newToken, user.getUsername(), user.getRole().name());
     }
 
     public void logout(User user) {

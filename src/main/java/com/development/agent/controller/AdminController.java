@@ -22,7 +22,10 @@ public class AdminController {
     public ResponseEntity<?> getAllUsers(@RequestParam(required = false) Integer page,
                                          @RequestParam(required = false) Integer size) {
         if (page != null && size != null) {
-            Pageable pageable = PageRequest.of(page, size);
+            // Clamp so unbounded/garbage values can't trigger an oversized DB query.
+            int safePage = Math.max(0, page);
+            int safeSize = Math.min(200, Math.max(1, size));
+            Pageable pageable = PageRequest.of(safePage, safeSize);
             return ResponseEntity.ok(adminService.getAllUsers(pageable));
         }
         // Backward compatible: no pagination params -> plain list (existing UI)
@@ -36,11 +39,8 @@ public class AdminController {
 
     @PutMapping("/user/{userId}/role")
     public ResponseEntity<?> changeRole(@PathVariable Long userId, @RequestBody Map<String, String> body) {
-        String role = body.get("role");
-        if (role == null || (!role.equals("ADMIN") && !role.equals("USER"))) {
-            return ResponseEntity.badRequest().body(Map.of("message", "Role must be ADMIN or USER"));
-        }
-        return ResponseEntity.ok(adminService.changeUserRole(userId, role));
+        // Invalid roles surface as IllegalArgumentException -> BAD_REQUEST ErrorResponse
+        return ResponseEntity.ok(adminService.changeUserRole(userId, body.get("role")));
     }
 
     @DeleteMapping("/user/{userId}")

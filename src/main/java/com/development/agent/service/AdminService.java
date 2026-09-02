@@ -1,8 +1,9 @@
 package com.development.agent.service;
 
 import com.development.agent.cache.UserCache;
+import com.development.agent.client.OpencodeClient;
 import com.development.agent.entity.Conversation;
-import com.development.agent.entity.TokenUsage;
+import com.development.agent.entity.Role;
 import com.development.agent.entity.User;
 import com.development.agent.repository.ChatMessageRepository;
 import com.development.agent.repository.ConversationRepository;
@@ -11,8 +12,13 @@ import com.development.agent.repository.UserRepository;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.LocalDateTime;
 import java.util.*;
@@ -21,26 +27,38 @@ import java.util.stream.Collectors;
 @Service
 public class AdminService {
 
+    /** Upper bound for the backward-compatible (non-paginated) user list endpoint. */
+    private static final int MAX_PLAIN_USER_LIST = 200;
+
+    private static final Logger log = LoggerFactory.getLogger(AdminService.class);
+
     private final UserRepository userRepository;
     private final ConversationRepository conversationRepository;
     private final ChatMessageRepository chatMessageRepository;
     private final TokenUsageRepository tokenUsageRepository;
     private final UserCache userCache;
+    private final OpencodeClient opencodeClient;
+    private final TransactionTemplate transactionTemplate;
 
     public AdminService(UserRepository userRepository,
                         ConversationRepository conversationRepository,
                         ChatMessageRepository chatMessageRepository,
                         TokenUsageRepository tokenUsageRepository,
-                        UserCache userCache) {
+                        UserCache userCache,
+                        OpencodeClient opencodeClient,
+                        PlatformTransactionManager transactionManager) {
         this.userRepository = userRepository;
         this.conversationRepository = conversationRepository;
         this.chatMessageRepository = chatMessageRepository;
         this.tokenUsageRepository = tokenUsageRepository;
         this.userCache = userCache;
+        this.opencodeClient = opencodeClient;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
+    /** Backward-compatible plain list, bounded to avoid unbounded responses. */
     public List<Map<String, Object>> getAllUsers() {
-        return toUserViews(userRepository.findAll());
+        return toUserViews(userRepository.findAll(PageRequest.of(0, MAX_PLAIN_USER_LIST, Sort.by("id"))).getContent());
     }
 
     /** Paginated user list with batched token/conversation aggregation (no N+1). */
@@ -76,7 +94,7 @@ public class AdminService {
             map.put("id", user.getId());
             map.put("username", user.getUsername());
             map.put("email", user.getEmail());
-            map.put("role", user.getRole());
+            map.put("role", user.getRole().name());
             map.put("enabled", user.isEnabled());
             map.put("createdAt", user.getCreatedAt());
             map.put("updatedAt", user.getUpdatedAt());
@@ -91,8 +109,8 @@ public class AdminService {
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new IllegalArgumentException("User not found"));
 
-        long adminCount = userRepository.countByRole("ADMIN");
-        if (user.getRole().equals("ADMIN") && user.isEnabled() && adminCount <= 1) {
+        long adminCount = userRepository.countByRole(Role.ADMIN);
+        if (user.getRole() == Role.ADMIN && user.isEnabled() && adminCount <= 1) {
             throw new IllegalArgumentException("Cannot disable the last remaining admin");
         }
 
@@ -113,17 +131,24 @@ public class AdminService {
 
     @Transactional
     public Map<String, Object> changeUserRole(Long userId, String role) {
+        Role newRole;
+        try {
+            newRole = Role.valueOf(role);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Role must be ADMIN or USER");
+        }
+
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new IllegalArgumentException("User not found"));
 
-        if (user.getRole().equals("ADMIN") && !role.equals("ADMIN")) {
-            long adminCount = userRepository.countByRole("ADMIN");
+        if (user.getRole() == Role.ADMIN && newRole != Role.ADMIN) {
+            long adminCount = userRepository.countByRole(Role.ADMIN);
             if (adminCount <= 1) {
                 throw new IllegalArgumentException("Cannot demote the last remaining admin");
             }
         }
 
-        user.setRole(role);
+        user.setRole(newRole);
         user.setActiveToken(null);
         userRepository.save(user);
         userCache.invalidate(userId);
@@ -131,34 +156,53 @@ public class AdminService {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("id", user.getId());
         result.put("username", user.getUsername());
-        result.put("role", user.getRole());
-        result.put("message", "Role updated to " + role);
+        result.put("role", user.getRole().name());
+        result.put("message", "Role updated to " + newRole.name());
         return result;
     }
 
-    @Transactional
+    /**
+     * Deletes a user plus all associated data. The blocking upstream opencode session
+     * deletions happen OUTSIDE any DB transaction; all database deletes run in a single
+     * short transaction as bulk operations (no per-row loops / N+1 writes).
+     */
     public Map<String, Object> deleteUser(Long userId) {
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new IllegalArgumentException("User not found"));
 
-        if (user.getRole().equals("ADMIN")) {
-            long adminCount = userRepository.countByRole("ADMIN");
+        if (user.getRole() == Role.ADMIN) {
+            long adminCount = userRepository.countByRole(Role.ADMIN);
             if (adminCount <= 1) {
                 throw new IllegalArgumentException("Cannot delete the last remaining admin");
             }
         }
 
-        // Delete dependent rows in FK-safe order:
-        // 1. token usage records referencing the user
-        tokenUsageRepository.deleteByUserId(userId);
-        // 2. chat messages + conversations referencing the user
+        // One read collects the user's conversations (ids for bulk delete + opencode
+        // session ids for best-effort upstream cleanup).
         List<Conversation> convos = conversationRepository.findByUserIdOrderByUpdatedAtDesc(userId);
+
+        // Best-effort upstream cleanup outside any transaction: no DB connection is held
+        // across network I/O, and an upstream failure here must not roll back the deletion.
         for (Conversation c : convos) {
-            chatMessageRepository.deleteByConversationExternalId(c.getExternalId());
-            conversationRepository.deleteByExternalId(c.getExternalId());
+            if (c.getOpencodeSessionId() != null && !c.getOpencodeSessionId().isBlank()) {
+                try {
+                    opencodeClient.deleteSession(c.getOpencodeSessionId());
+                } catch (Exception e) {
+                    log.warn("Could not delete opencode session {} while deleting user {}: {}",
+                            c.getOpencodeSessionId(), userId, e.getMessage());
+                }
+            }
         }
-        // 3. the user
-        userRepository.deleteById(userId);
+
+        // All DB deletes in one transaction, FK-safe order (messages -> conversations ->
+        // token usage -> user), executed as bulk statements rather than per-row loops.
+        List<Long> conversationIds = convos.stream().map(Conversation::getId).toList();
+        transactionTemplate.executeWithoutResult(status -> {
+            chatMessageRepository.bulkDeleteByConversationIds(conversationIds);
+            conversationRepository.deleteByUserId(userId);
+            tokenUsageRepository.deleteByUserId(userId);
+            userRepository.deleteById(userId);
+        });
         userCache.invalidate(userId);
 
         Map<String, Object> result = new LinkedHashMap<>();
@@ -182,7 +226,8 @@ public class AdminService {
         }).collect(Collectors.toList());
         stats.put("tokensByModel", modelBreakdown);
 
-        List<Map<String, Object>> dailyUsage = aggregateDailyUsage(tokenUsageRepository.findByCreatedAtGreaterThanEqual(LocalDateTime.now().minusDays(30)));
+        List<Map<String, Object>> dailyUsage = aggregateDailyUsage(
+                tokenUsageRepository.sumTokensPerDaySince(LocalDateTime.now().minusDays(30)));
         stats.put("dailyUsage", dailyUsage);
 
         return stats;
@@ -207,23 +252,22 @@ public class AdminService {
         }).collect(Collectors.toList());
         stats.put("tokensByModel", modelBreakdown);
 
-        List<Map<String, Object>> dailyUsage = aggregateDailyUsage(tokenUsageRepository.findByUserIdAndCreatedAtGreaterThanEqual(userId, LocalDateTime.now().minusDays(30)));
+        List<Map<String, Object>> dailyUsage = aggregateDailyUsage(
+                tokenUsageRepository.sumTokensPerDaySinceForUser(userId, LocalDateTime.now().minusDays(30)));
         stats.put("dailyUsage", dailyUsage);
 
         return stats;
     }
 
-    private List<Map<String, Object>> aggregateDailyUsage(List<com.development.agent.entity.TokenUsage> records) {
-        TreeMap<String, Long> byDay = new TreeMap<>();
-        for (com.development.agent.entity.TokenUsage t : records) {
-            String day = t.getCreatedAt().toLocalDate().toString();
-            byDay.merge(day, t.getTokensInput() + t.getTokensOutput(), Long::sum);
-        }
-        List<Map<String, Object>> result = new ArrayList<>();
-        for (Map.Entry<String, Long> e : byDay.entrySet()) {
+    /**
+     * Aggregates daily usage from {@code [day, totalTokens]} rows returned by the DB.
+     */
+    private List<Map<String, Object>> aggregateDailyUsage(List<Object[]> rows) {
+        List<Map<String, Object>> result = new ArrayList<>(rows.size());
+        for (Object[] row : rows) {
             Map<String, Object> m = new LinkedHashMap<>();
-            m.put("date", e.getKey());
-            m.put("tokens", e.getValue());
+            m.put("date", row[0].toString());
+            m.put("tokens", ((Number) row[1]).longValue());
             result.add(m);
         }
         return result;

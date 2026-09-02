@@ -25,6 +25,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
+import com.development.agent.exception.ErrorResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -128,9 +129,11 @@ public class CryptoFilter implements Filter {
     }
 
     private void writePlainError(HttpServletResponse resp, int status, String code, String message) throws IOException {
+        // Unified ErrorResponse shape ({code, message, timestamp}) shared by all
+        // filter-level failures (JwtAuthFilter, RateLimitFilter, security entry point).
+        String body = MAPPER.writeValueAsString(new ErrorResponse(code, message, System.currentTimeMillis()));
         resp.setStatus(status);
         resp.setContentType("application/json");
-        String body = "{\"code\":\"" + code + "\",\"message\":\"" + message + "\"}";
         resp.getOutputStream().write(body.getBytes(StandardCharsets.UTF_8));
         resp.flushBuffer();
     }

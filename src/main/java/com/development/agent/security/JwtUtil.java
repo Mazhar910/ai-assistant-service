@@ -17,7 +17,25 @@ public class JwtUtil {
 
     public JwtUtil(@Value("${app.jwt.secret}") String secret,
                    @Value("${app.jwt.expiration-ms}") long expirationMs) {
-        this.key = Keys.hmacShaKeyFor(Base64.getDecoder().decode(secret));
+        if (secret == null || secret.isBlank()) {
+            throw new IllegalStateException(
+                    "app.jwt.secret is not configured. Set the JWT_SECRET environment variable to a " +
+                            "random Base64 value (e.g. `openssl rand -base64 48`). Refusing to start with " +
+                            "a missing or default signing key.");
+        }
+        byte[] keyBytes;
+        try {
+            keyBytes = Base64.getDecoder().decode(secret);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalStateException(
+                    "app.jwt.secret is not valid Base64. Configure JWT_SECRET as Base64-encoded random bytes.", e);
+        }
+        if (keyBytes.length < 32) {
+            throw new IllegalStateException(
+                    "app.jwt.secret must decode to at least 32 bytes (256-bit HMAC key). " +
+                            "Configure a longer JWT_SECRET.");
+        }
+        this.key = Keys.hmacShaKeyFor(keyBytes);
         this.expirationMs = expirationMs;
     }
 
@@ -51,13 +69,5 @@ public class JwtUtil {
 
     public Long getUserId(String token) {
         return Long.parseLong(parseToken(token).getSubject());
-    }
-
-    public String getUsername(String token) {
-        return parseToken(token).get("username", String.class);
-    }
-
-    public String getRole(String token) {
-        return parseToken(token).get("role", String.class);
     }
 }

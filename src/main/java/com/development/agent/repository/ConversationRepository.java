@@ -1,6 +1,7 @@
 package com.development.agent.repository;
 
 import com.development.agent.entity.Conversation;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -10,7 +11,9 @@ import java.util.Optional;
 
 public interface ConversationRepository extends JpaRepository<Conversation, Long> {
     Optional<Conversation> findByExternalId(String externalId);
+    boolean existsByExternalIdAndUserId(String externalId, Long userId);
     List<Conversation> findByUserIdOrderByUpdatedAtDesc(Long userId);
+    List<Conversation> findByUserIdOrderByUpdatedAtDesc(Long userId, Pageable pageable);
     void deleteByExternalId(String externalId);
     void deleteByUserId(Long userId);
 

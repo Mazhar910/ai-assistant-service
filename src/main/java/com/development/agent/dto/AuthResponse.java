@@ -7,7 +7,6 @@ public class AuthResponse {
     private String token;
     private String username;
     private String role;
-    private String message;
 
     public AuthResponse() {}
 
@@ -21,12 +20,6 @@ public class AuthResponse {
         return new AuthResponse(token, username, role);
     }
 
-    public static AuthResponse error(String message) {
-        AuthResponse resp = new AuthResponse();
-        resp.setMessage(message);
-        return resp;
-    }
-
     public String getToken() { return token; }
     public void setToken(String token) { this.token = token; }
 
@@ -35,7 +28,4 @@ public class AuthResponse {
 
     public String getRole() { return role; }
     public void setRole(String role) { this.role = role; }
-
-    public String getMessage() { return message; }
-    public void setMessage(String message) { this.message = message; }
 }

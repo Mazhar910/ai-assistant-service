@@ -15,7 +15,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -69,16 +68,22 @@ public class OpencodeClient {
      * passed in the request body so the opencode server routes the turn to that
      * specific model instead of falling back to its default. Used by the model
      * fallback chain in {@code AiAgentService}.
+     *
+     * <p>The opencode HTTP API ({@code POST /session/{id}/message}) requires {@code model}
+     * to be a structured object {@code {providerID, modelID}}, not a flat string. A string
+     * model like {@code "opencode/big-pickle"} is rejected with HTTP {@code 400}, so the
+     * {@code "providerID/modelID"} string is split into an object before sending.</p>
      */
     public String sendMessage(String sessionId, String systemPrompt, String userText, String model) {
         String url = baseUrl + "/session/" + sessionId + "/message";
-        log.info("Sending message to opencode session {} (model={}): {}", sessionId, model, userText);
+        log.info("Sending message to opencode session {} (model={})", sessionId, model);
+        log.debug("Opencode message text for session {}: {}", sessionId, userText);
 
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("parts", List.of(Map.of("type", "text", "text", userText)));
         payload.put("system", systemPrompt);
         if (model != null && !model.isBlank()) {
-            payload.put("model", model);
+            payload.put("model", toModelObject(model));
         }
 
         String jsonPayload;
@@ -146,28 +151,24 @@ public class OpencodeClient {
         return "USER";
     }
 
-    public List<MapMessage> getMessages(String sessionId) {
-        String url = baseUrl + "/session/" + sessionId + "/message";
-        log.info("Fetching messages for opencode session {}", sessionId);
-        Request request = new Request.Builder().url(url).get().build();
-        String body = execute(request, "fetch messages of session " + sessionId);
-        try {
-            JsonNode root = objectMapper.readTree(body);
-            List<MapMessage> messages = new ArrayList<>();
-            if (root.isArray()) {
-                for (JsonNode item : root) {
-                    String role = "assistant".equals(item.path("info").path("role").asText("assistant")) ? "assistant" : "user";
-                    String content = extractTextFromParts(item.path("parts"));
-                    if (!content.isEmpty()) {
-                        messages.add(new MapMessage(role, content));
-                    }
-                }
-            }
-            log.info("Retrieved {} messages from session {}", messages.size(), sessionId);
-            return messages;
-        } catch (IOException e) {
-            throw new AiAgentException("Could not parse opencode history response: " + e.getMessage(), "UPSTREAM_ERROR");
+    /**
+     * Converts a {@code "providerID/modelID"} string (as configured in
+     * {@code ai.opencode.models}) into the structured {@code {providerID, modelID}}
+     * object the opencode HTTP API requires for a message's {@code model} field.
+     * Without a separator the whole value is treated as the model id, matching
+     * opencode's own {@code provider/model} parsing semantics.
+     */
+    private static Map<String, String> toModelObject(String model) {
+        int slash = model.indexOf('/');
+        Map<String, String> result = new LinkedHashMap<>();
+        if (slash < 0) {
+            result.put("providerID", "default");
+            result.put("modelID", model.trim());
+        } else {
+            result.put("providerID", model.substring(0, slash).trim());
+            result.put("modelID", model.substring(slash + 1).trim());
         }
+        return result;
     }
 
     public boolean deleteSession(String sessionId) {
@@ -185,8 +186,11 @@ public class OpencodeClient {
             log.debug("{}: status={}, time={} ms, body={}",
                     action, response.code(), System.currentTimeMillis() - start, body);
             if (!response.isSuccessful()) {
+                // Keep the upstream response body out of the exception message so it is never
+                // surfaced to clients; the body is available in the debug log above.
+                log.warn("{} failed: HTTP {}, body={}", action, response.code(), body);
                 throw new AiAgentException("Opencode failed to " + action + " (HTTP "
-                        + response.code() + "): " + body, "UPSTREAM_ERROR", response.code());
+                        + response.code() + ")", "UPSTREAM_ERROR", response.code());
             }
             return body;
         } catch (AiAgentException e) {
@@ -201,7 +205,8 @@ public class OpencodeClient {
         try {
             JsonNode root = objectMapper.readTree(responseJson);
             String text = extractTextFromParts(root.path("parts"));
-            log.info("Received {} from opencode session {}", text, sessionId);
+            log.info("Received {} chars from opencode session {}", text == null ? 0 : text.length(), sessionId);
+            log.debug("Opencode response text from session {}: {}", sessionId, text);
             return text;
         } catch (IOException e) {
             throw new AiAgentException("Could not parse opencode response: " + e.getMessage(), "UPSTREAM_ERROR");

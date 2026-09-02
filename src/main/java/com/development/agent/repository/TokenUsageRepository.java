@@ -27,7 +27,15 @@ public interface TokenUsageRepository extends JpaRepository<TokenUsage, Long> {
     @Query("SELECT t.user.id, COALESCE(SUM(t.tokensInput + t.tokensOutput), 0) FROM TokenUsage t WHERE t.user.id IN :userIds GROUP BY t.user.id")
     List<Object[]> sumTokensByUserIds(@Param("userIds") List<Long> userIds);
 
-    List<TokenUsage> findByCreatedAtGreaterThanEqual(LocalDateTime since);
+    /** Aggregated daily totals, [day, tokens], for all users since {@code since}. */
+    @Query("SELECT CAST(t.createdAt AS date) AS day, COALESCE(SUM(t.tokensInput + t.tokensOutput), 0) " +
+            "FROM TokenUsage t WHERE t.createdAt >= :since " +
+            "GROUP BY CAST(t.createdAt AS date) ORDER BY CAST(t.createdAt AS date)")
+    List<Object[]> sumTokensPerDaySince(@Param("since") LocalDateTime since);
 
-    List<TokenUsage> findByUserIdAndCreatedAtGreaterThanEqual(Long userId, LocalDateTime since);
+    /** Aggregated daily totals, [day, tokens], for a single user since {@code since}. */
+    @Query("SELECT CAST(t.createdAt AS date) AS day, COALESCE(SUM(t.tokensInput + t.tokensOutput), 0) " +
+            "FROM TokenUsage t WHERE t.user.id = :userId AND t.createdAt >= :since " +
+            "GROUP BY CAST(t.createdAt AS date) ORDER BY CAST(t.createdAt AS date)")
+    List<Object[]> sumTokensPerDaySinceForUser(@Param("userId") Long userId, @Param("since") LocalDateTime since);
 }

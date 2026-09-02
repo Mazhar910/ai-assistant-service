@@ -1,5 +1,8 @@
 package com.development.agent.security;
 
+import com.development.agent.exception.ErrorResponse;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PreDestroy;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -7,11 +10,17 @@ import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Per-key rate limiter using a fixed-window sliding counter. Keyed by the
@@ -27,17 +36,47 @@ public class RateLimitFilter extends OncePerRequestFilter {
     private static final Logger log = LoggerFactory.getLogger(RateLimitFilter.class);
 
     private final JwtUtil jwtUtil;
+    private final ObjectMapper objectMapper;
 
     @Value("${app.security.rate-limit-per-minute:0}")
     private int rateLimitPerMinute;
 
     /** key -> long[]{windowStartMillis, count} */
     private final ConcurrentHashMap<String, long[]> buckets = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService janitor;
 
     private static final long WINDOW_MS = 60_000L;
 
-    public RateLimitFilter(JwtUtil jwtUtil) {
+    public RateLimitFilter(JwtUtil jwtUtil, ObjectMapper objectMapper) {
         this.jwtUtil = jwtUtil;
+        this.objectMapper = objectMapper;
+        // Periodically drop buckets whose window has fully elapsed so the map doesn't
+        // accumulate an entry per historical user/IP forever.
+        this.janitor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "rate-limit-janitor");
+            t.setDaemon(true);
+            return t;
+        });
+        this.janitor.scheduleWithFixedDelay(this::sweepStaleBuckets, WINDOW_MS, WINDOW_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private void sweepStaleBuckets() {
+        long now = System.currentTimeMillis();
+        int removed = 0;
+        for (Map.Entry<String, long[]> entry : buckets.entrySet()) {
+            if (now - entry.getValue()[0] >= WINDOW_MS) {
+                buckets.remove(entry.getKey(), entry.getValue());
+                removed++;
+            }
+        }
+        if (removed > 0) {
+            log.debug("Evicted {} stale rate-limit buckets", removed);
+        }
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        janitor.shutdownNow();
     }
 
     @Override
@@ -58,10 +97,11 @@ public class RateLimitFilter extends OncePerRequestFilter {
         String key = resolveKey(request);
         if (!allow(key)) {
             log.warn("Rate limit exceeded for key {}", key);
+            ErrorResponse error = new ErrorResponse("RATE_LIMITED",
+                    "Too many requests. Please slow down and try again later.", System.currentTimeMillis());
             response.setStatus(429);
-            response.setContentType("application/json");
-            response.getWriter()
-                    .write("{\"code\":\"RATE_LIMITED\",\"message\":\"Too many requests. Please slow down and try again later.\"}");
+            response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+            response.getWriter().write(objectMapper.writeValueAsString(error));
             return;
         }
 
@@ -83,18 +123,26 @@ public class RateLimitFilter extends OncePerRequestFilter {
         return "ip:" + (ip == null ? "unknown" : ip);
     }
 
-    private synchronized boolean allow(String key) {
+    /**
+     * Fixed-window counter, updated atomically per key via {@code compute} so requests
+     * for different keys never contend on a shared lock.
+     */
+    private boolean allow(String key) {
         long now = System.currentTimeMillis();
-        long[] bucket = buckets.get(key);
-        if (bucket == null || now - bucket[0] >= WINDOW_MS) {
-            buckets.put(key, new long[]{now, 1});
-            return true;
-        }
-        int count = (int) bucket[1];
-        if (count >= rateLimitPerMinute) {
-            return false;
-        }
-        bucket[1] = count + 1;
-        return true;
+        AtomicBoolean allowed = new AtomicBoolean(false);
+        buckets.compute(key, (k, bucket) -> {
+            if (bucket == null || now - bucket[0] >= WINDOW_MS) {
+                allowed.set(true);
+                return new long[]{now, 1};
+            }
+            if (bucket[1] >= rateLimitPerMinute) {
+                allowed.set(false);
+                return bucket;
+            }
+            bucket[1]++;
+            allowed.set(true);
+            return bucket;
+        });
+        return allowed.get();
     }
 }

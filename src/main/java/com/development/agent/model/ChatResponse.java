@@ -3,7 +3,6 @@ package com.development.agent.model;
 import com.fasterxml.jackson.annotation.JsonInclude;
 
 import java.time.LocalDateTime;
-import java.util.List;
 
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public class ChatResponse {
@@ -11,15 +10,20 @@ public class ChatResponse {
     private String conversationId;
     private String reply;
     private LocalDateTime timestamp;
-    private List<ChatMessage> history;
+    private String model;
 
     public ChatResponse() {
     }
 
     public ChatResponse(String conversationId, String reply, LocalDateTime timestamp) {
+        this(conversationId, reply, timestamp, null);
+    }
+
+    public ChatResponse(String conversationId, String reply, LocalDateTime timestamp, String model) {
         this.conversationId = conversationId;
         this.reply = reply;
         this.timestamp = timestamp;
+        this.model = model;
     }
 
     public String getConversationId() {
@@ -46,11 +50,12 @@ public class ChatResponse {
         this.timestamp = timestamp;
     }
 
-    public List<ChatMessage> getHistory() {
-        return history;
+    /** Model that produced this reply, when one was selected via the fallback chain. */
+    public String getModel() {
+        return model;
     }
 
-    public void setHistory(List<ChatMessage> history) {
-        this.history = history;
+    public void setModel(String model) {
+        this.model = model;
     }
 }

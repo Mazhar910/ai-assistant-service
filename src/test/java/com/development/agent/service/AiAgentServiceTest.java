@@ -27,6 +27,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -63,6 +64,9 @@ class AiAgentServiceTest {
         user.setId(1L);
         lenient().when(conversationRepository.save(any(Conversation.class)))
                 .thenAnswer(inv -> inv.getArgument(0));
+        // Default ownership check outcome: existing conversations belong to the user.
+        lenient().when(conversationRepository.existsByExternalIdAndUserId(anyString(), anyLong()))
+                .thenReturn(true);
         lenient().when(chatMessageRepository.save(any(ChatMessageEntity.class)))
                 .thenAnswer(inv -> inv.getArgument(0));
         lenient().when(tokenUsageRepository.save(any(TokenUsage.class)))
@@ -249,17 +253,25 @@ class AiAgentServiceTest {
     }
 
     @Test
-    void nonRateLimitErrorDoesNotFallBackToNextModel() {
+    void nonRateLimitErrorDoesNotFallBackToNextModelAndUsesRecoveryInstead() {
         Conversation convo = conversation("conv-nonrl", "oc-nonrl");
         when(conversationRepository.findByExternalId("conv-nonrl")).thenReturn(Optional.of(convo));
         ReflectionTestUtils.setField(service, "modelChainConfig",
                 "opencode/big-pickle,opencode/ling-3.0-flash-fin-free");
         when(opencodeClient.sendMessage(eq("oc-nonrl"), anyString(), anyString(), eq("opencode/big-pickle")))
                 .thenThrow(new AiAgentException("bad gateway", "UPSTREAM_ERROR", 502));
+        when(opencodeClient.createSession()).thenReturn("oc-nonrl-fresh");
+        when(opencodeClient.sendMessage(eq("oc-nonrl-fresh"), anyString(), anyString(), anyString()))
+                .thenThrow(new AiAgentException("fresh session also down", "UPSTREAM_ERROR", 502));
+        lenient().when(opencodeClient.deleteSession(anyString())).thenReturn(true);
 
-        assertThrows(AiAgentException.class, () -> service.chat(req("conv-nonrl", "hello"), user));
+        AiAgentException ex = assertThrows(AiAgentException.class,
+                () -> service.chat(req("conv-nonrl", "hello"), user));
+
+        assertEquals(502, ex.getStatus());
         verify(opencodeClient, never())
                 .sendMessage(eq("oc-nonrl"), anyString(), anyString(), eq("opencode/ling-3.0-flash-fin-free"));
+        verify(opencodeClient).createSession();
     }
 
     @Test

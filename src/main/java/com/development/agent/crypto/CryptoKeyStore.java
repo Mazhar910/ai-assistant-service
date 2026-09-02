@@ -5,6 +5,9 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
@@ -24,6 +27,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Holds the server RSA keypair and the per-session AES keys established during the
@@ -54,6 +60,7 @@ public class CryptoKeyStore {
     private final PublicKey publicKey;
 
     private final Map<String, SecKey> sessions = new ConcurrentHashMap<>();
+    private ScheduledExecutorService janitor;
 
     @Value("${app.crypto.session-ttl-seconds:3600}")
     private long sessionTtlSeconds;
@@ -74,6 +81,44 @@ public class CryptoKeyStore {
     public String publicKeyPem() {
         String b64 = Base64.getEncoder().encodeToString(publicKey.getEncoded());
         return b64;
+    }
+
+    /**
+     * Periodically evicts expired session keys so the {@code sessions} map does not
+     * grow unboundedly on long-lived deployments.
+     */
+    @PostConstruct
+    void startJanitor() {
+        long ttlMs = Math.max(1, sessionTtlSeconds) * 1000L;
+        long sweepMs = Math.max(15_000L, ttlMs / 4);
+        janitor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "crypto-key-janitor");
+            t.setDaemon(true);
+            return t;
+        });
+        janitor.scheduleWithFixedDelay(this::sweepExpiredSessions, sweepMs, sweepMs, TimeUnit.MILLISECONDS);
+        log.info("CryptoKeyStore janitor started (sweeps expired sessions every {} ms)", sweepMs);
+    }
+
+    private void sweepExpiredSessions() {
+        long now = System.currentTimeMillis();
+        int removed = 0;
+        for (Map.Entry<String, SecKey> entry : sessions.entrySet()) {
+            if (entry.getValue().expiresAt() < now) {
+                sessions.remove(entry.getKey(), entry.getValue());
+                removed++;
+            }
+        }
+        if (removed > 0) {
+            log.info("Evicted {} expired crypto sessions", removed);
+        }
+    }
+
+    @PreDestroy
+    void shutdown() {
+        if (janitor != null) {
+            janitor.shutdownNow();
+        }
     }
 
     /** Decrypt the client AES key (encrypted with RSA public key) and store it for a session. */

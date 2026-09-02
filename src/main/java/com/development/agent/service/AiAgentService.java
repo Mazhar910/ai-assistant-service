@@ -19,6 +19,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
@@ -28,6 +29,7 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 @Service
@@ -55,6 +57,7 @@ public class AiAgentService {
     private final TransactionTemplate transactionTemplate;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final AtomicReference<CachedSuggestions> suggestionsCache = new AtomicReference<>(null);
+    private final AtomicBoolean suggestionsRefreshInFlight = new AtomicBoolean(false);
 
     @Value("${app.suggestions-cache-ttl-seconds:600}")
     private long suggestionsCacheTtlSeconds;
@@ -102,21 +105,23 @@ public class AiAgentService {
 
     /**
      * Synchronous chat path (default UX). Runs the whole turn on the request thread.
-     * For high-concurrency scale deployments, use the async job path instead
-     * (see ChatJobService) so request threads are not blocked on the upstream AI.
+     * The upstream AI call deliberately happens OUTSIDE any DB transaction: persistence
+     * is scoped to {@link #persistTurn} via TransactionTemplate so no DB connection is
+     * held open during AI inference. For high-concurrency scale deployments, use the
+     * async job path instead (see ChatJobService) so request threads are not blocked.
      */
-    @Transactional
     public ChatResponse chat(ChatRequest request, User user) {
         if (request.getMessage() == null || request.getMessage().isBlank()) {
             throw new IllegalArgumentException("Message must not be empty");
         }
         long start = System.currentTimeMillis();
         String sessionId = resolveOrCreateConversation(request, user);
-        String reply = sendToOpencode(sessionId, request.getMessage());
+        ModelReply reply = sendToOpencode(sessionId, request.getMessage());
         int inputTokens = estimateTokens(request.getMessage());
-        int outputTokens = estimateTokens(reply);
-        persistTurn(user, sessionId, request.getMessage(), reply, inputTokens, outputTokens, start);
-        return new ChatResponse(sessionId, reply, LocalDateTime.now());
+        int outputTokens = estimateTokens(reply.reply());
+        persistTurn(user, sessionId, request.getMessage(), reply.reply(), reply.model(),
+                inputTokens, outputTokens, start);
+        return new ChatResponse(sessionId, reply.reply(), LocalDateTime.now(), reply.model());
     }
 
     /**
@@ -133,19 +138,14 @@ public class AiAgentService {
         long start = System.currentTimeMillis();
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new IllegalArgumentException("User not found"));
-        String resolvedId = conversationId;
-        if (resolvedId == null || resolvedId.isBlank()) {
-            resolvedId = createNewConversation(message, user);
-        } else {
-            ensureOwnership(resolvedId, user);
-        }
+        String resolvedId = resolveConversationForJob(user, conversationId, message);
         // Network call outside a transaction (avoids holding a DB connection during inference)
-        String reply = sendToOpencode(resolvedId, message);
+        ModelReply reply = sendToOpencode(resolvedId, message);
         int inputTokens = estimateTokens(message);
-        int outputTokens = estimateTokens(reply);
+        int outputTokens = estimateTokens(reply.reply());
         // Short, scoped transaction for persistence
-        persistTurn(user, resolvedId, message, reply, inputTokens, outputTokens, start);
-        return reply;
+        persistTurn(user, resolvedId, message, reply.reply(), reply.model(), inputTokens, outputTokens, start);
+        return reply.reply();
     }
 
     /**
@@ -160,27 +160,65 @@ public class AiAgentService {
 
     private List<String> nextSuggestions() {
         CachedSuggestions cached = suggestionsCache.get();
+        CachedSuggestions usable = cached;
         if (cached == null || cached.expiresAt() <= System.currentTimeMillis()) {
-            List<String> batch = generateSuggestionsBatch();
-            if (batch == null || batch.size() < SUGGESTIONS_PER_VIEW) {
-                batch = defaultBatch();
-            }
-            long ttlMs = Math.max(1, suggestionsCacheTtlSeconds) * 1000L;
-            suggestionsCache.set(new CachedSuggestions(batch, System.currentTimeMillis() + ttlMs));
-            cached = suggestionsCache.get();
+            usable = refreshSuggestions(cached);
         }
 
-        List<String> batch = cached.suggestions();
-        int start = cached.nextStart();
-        List<String> view = pick(batch, start, SUGGESTIONS_PER_VIEW);
+        List<String> view = pick(usable.suggestions(), usable.nextStart(), SUGGESTIONS_PER_VIEW);
 
-        // Advance the rotation pointer so the next request returns a different subset.
-        CachedSuggestions existing = suggestionsCache.get();
-        if (existing != null) {
-            int next = (start + SUGGESTIONS_PER_VIEW) % Math.max(1, batch.size());
-            suggestionsCache.set(new CachedSuggestions(batch, existing.expiresAt(), next));
+        // Advance the rotation pointer atomically so concurrent requests don't clobber
+        // each other's updates (CAS loop).
+        while (true) {
+            CachedSuggestions existing = suggestionsCache.get();
+            if (existing == null) {
+                break;
+            }
+            int next = (existing.nextStart() + SUGGESTIONS_PER_VIEW) % Math.max(1, existing.suggestions().size());
+            CachedSuggestions updatedCache = new CachedSuggestions(existing.suggestions(), existing.expiresAt(), next);
+            if (suggestionsCache.compareAndSet(existing, updatedCache)) {
+                break;
+            }
         }
         return view;
+    }
+
+    /**
+     * Coalesced cache refresh. Only one thread calls the upstream batch generation;
+     * concurrent waiters reuse the stale cache (or a default batch) without blocking.
+     * Never throws: any generation failure falls back to {@link #defaultBatch()}.
+     */
+    private CachedSuggestions refreshSuggestions(CachedSuggestions existing) {
+        long ttlMs = Math.max(1, suggestionsCacheTtlSeconds) * 1000L;
+        boolean won = suggestionsRefreshInFlight.compareAndSet(false, true);
+        try {
+            if (won) {
+                List<String> batch;
+                try {
+                    batch = generateSuggestionsBatch();
+                    if (batch == null || batch.size() < SUGGESTIONS_PER_VIEW) {
+                        batch = defaultBatch();
+                    }
+                } catch (AiAgentException e) {
+                    log.warn("AI suggestions generation failed (HTTP {} {}): using fallback batch",
+                            e.getStatus(), e.getCode());
+                    batch = defaultBatch();
+                } catch (Exception e) {
+                    log.warn("AI suggestions generation failed: {}", e.getMessage());
+                    batch = defaultBatch();
+                }
+                CachedSuggestions fresh = new CachedSuggestions(batch, System.currentTimeMillis() + ttlMs);
+                suggestionsCache.set(fresh);
+                return fresh;
+            }
+            // Another thread is refreshing: serve stale suggestions (or a default) now.
+            if (existing != null) {
+                return existing;
+            }
+            return new CachedSuggestions(defaultBatch(), System.currentTimeMillis() + ttlMs);
+        } finally {
+            suggestionsRefreshInFlight.set(false);
+        }
     }
 
     private List<String> pick(List<String> batch, int start, int count) {
@@ -201,12 +239,12 @@ public class AiAgentService {
                     "creative tasks, learning, and productivity. Each should be concrete and useful. " +
                     "Respond with ONLY a JSON array of " + SUGGESTIONS_BATCH_SIZE +
                     " strings, e.g. [\"...\",\"...\"] and nothing else.";
-            String reply = opencodeClient.sendMessage(sessionId, SYSTEM_PROMPT, prompt);
-            List<String> parsed = parseSuggestions(reply);
+            ModelReply modelReply = sendWithModelChain(sessionId, prompt, "Suggestion batch");
+            List<String> parsed = parseSuggestions(modelReply.reply());
             if (parsed != null && parsed.size() >= SUGGESTIONS_PER_VIEW) {
                 return parsed;
             }
-            log.warn("Could not parse AI suggestions, using fallback; raw reply: {}", reply);
+            log.warn("Could not parse AI suggestions, using fallback; raw reply: {}", modelReply.reply());
         } finally {
             try {
                 opencodeClient.deleteSession(sessionId);
@@ -279,12 +317,21 @@ public class AiAgentService {
     }
 
     private String resolveOrCreateConversation(ChatRequest request, User user) {
-        String sessionId = request.getConversationId();
-        if (sessionId == null || sessionId.isBlank()) {
-            return createNewConversation(request.getMessage(), user);
+        return resolveConversationForJob(user, request.getConversationId(), request.getMessage());
+    }
+
+    /**
+     * Resolves the conversation for a chat turn (sync or async/retry). A blank
+     * {@code conversationId} creates a new conversation; otherwise ownership is
+     * verified and the id is returned. Called BEFORE a job is submitted so every
+     * retry attempt reuses exactly one conversation instead of creating orphans.
+     */
+    public String resolveConversationForJob(User user, String conversationId, String firstMessage) {
+        if (conversationId == null || conversationId.isBlank()) {
+            return createNewConversation(firstMessage, user);
         }
-        ensureOwnership(sessionId, user);
-        return sessionId;
+        ensureOwnership(conversationId, user);
+        return conversationId;
     }
 
     private String createNewConversation(String firstMessage, User user) {
@@ -300,14 +347,14 @@ public class AiAgentService {
     }
 
     private void ensureOwnership(String sessionId, User user) {
-        Conversation conversation = conversationRepository.findByExternalId(sessionId)
-                .orElseThrow(() -> new IllegalArgumentException("Conversation not found"));
-        if (!conversation.getUser().getId().equals(user.getId())) {
-            throw new IllegalArgumentException("Access denied to this conversation");
+        // Ownership check via a narrow EXISTS query that touches no lazy-loaded
+        // associations, so it stays safe outside an open session (OSIV off / async).
+        if (!conversationRepository.existsByExternalIdAndUserId(sessionId, user.getId())) {
+            throw new IllegalArgumentException("Conversation not found or access denied");
         }
     }
 
-    private String sendToOpencode(String sessionId, String message) {
+    private ModelReply sendToOpencode(String sessionId, String message) {
         Conversation conversation = conversationRepository.findByExternalId(sessionId)
                 .orElseThrow(() -> new IllegalArgumentException("Conversation not found"));
         String opencodeSessionId = conversation.getOpencodeSessionId();
@@ -319,12 +366,17 @@ public class AiAgentService {
             return sendWithModelChain(opencodeSessionId, message,
                     "Chat turn " + turn + " for conversation " + sessionId);
         } catch (AiAgentException e) {
+            // All models in the chain were rate-limited: session recovery won't help a
+            // quota issue, surface the 429 to the caller so they can retry later.
+            if (e.getStatus() == 429) {
+                throw e;
+            }
             // The OpenCode session is unreachable or unusable (e.g. wedged, timed out, or
             // the server was restarted). Recover by replaying the application's persisted
             // history into a fresh OpenCode session so model context is preserved, then retry.
             log.warn("Opencode session {} failed for conversation {} ({}). Recovering by " +
                             "replaying {} persisted messages into a fresh session.",
-                    opencodeSessionId, sessionId, e.getCode(), countUserTurns(conversation), e);
+                    opencodeSessionId, sessionId, e.getCode(), turn - 1, e);
             return recoverSession(conversation, message, turn);
         }
     }
@@ -340,13 +392,13 @@ public class AiAgentService {
      * exhausted model on every message. If every model is rate-limited a {@code 429}
      * {@link AiAgentException} is rethrown so the caller can surface it to the user.
      */
-    private String sendWithModelChain(String opencodeSessionId, String message, String actionLabel) {
+    private ModelReply sendWithModelChain(String opencodeSessionId, String message, String actionLabel) {
         List<String> models = resolveModelChain();
 
         if (models.isEmpty()) {
             // No chain configured: rely on the opencode server's default model.
             log.info("{}: no model chain configured, using opencode default", actionLabel);
-            return opencodeClient.sendMessage(opencodeSessionId, SYSTEM_PROMPT, message);
+            return new ModelReply(opencodeClient.sendMessage(opencodeSessionId, SYSTEM_PROMPT, message), null);
         }
 
         int startIndex = currentStartIndex(models.size());
@@ -356,7 +408,7 @@ public class AiAgentService {
             try {
                 String reply = opencodeClient.sendMessage(opencodeSessionId, SYSTEM_PROMPT, message, model);
                 log.info("{} completed via model {}", actionLabel, model);
-                return reply;
+                return new ModelReply(reply, model);
             } catch (AiAgentException e) {
                 boolean isRateLimit = e.getStatus() == 429;
                 log.warn("{} failed with model {}: HTTP {} ({}). {}",
@@ -434,12 +486,12 @@ public class AiAgentService {
      * replays the persisted application history into it, updates the mapping, and
      * resends the current user message. Application history is never modified/corrupted.
      */
-    private String recoverSession(Conversation conversation, String message, int turn) {
+    private ModelReply recoverSession(Conversation conversation, String message, int turn) {
         List<OpencodeClient.MapMessage> history = loadHistory(conversation);
         String freshOpencodeSessionId = opencodeClient.createSession();
         try {
             opencodeClient.replayHistory(freshOpencodeSessionId, SYSTEM_PROMPT, history);
-            String reply = sendWithModelChain(freshOpencodeSessionId, message,
+            ModelReply reply = sendWithModelChain(freshOpencodeSessionId, message,
                     "Recovered turn " + turn + " for conversation " + conversation.getExternalId());
             conversation.setOpencodeSessionId(freshOpencodeSessionId);
             conversationRepository.save(conversation);
@@ -459,10 +511,7 @@ public class AiAgentService {
 
     private int countUserTurns(Conversation conversation) {
         return (int) chatMessageRepository
-                .findByConversationIdOrderByCreatedAtAsc(conversation.getId())
-                .stream()
-                .filter(m -> "user".equalsIgnoreCase(m.getRole()))
-                .count();
+                .countByConversationIdAndRole(conversation.getId(), "user");
     }
 
     private List<OpencodeClient.MapMessage> loadHistory(Conversation conversation) {
@@ -473,9 +522,9 @@ public class AiAgentService {
     }
 
     private void persistTurn(User user, String sessionId, String message, String reply,
-                             int inputTokens, int outputTokens, long start) {
-        // TransactionTemplate: safe to call from both the sync @Transactional path
-        // (joins the existing tx) and the async worker path (starts its own short tx).
+                             String model, int inputTokens, int outputTokens, long start) {
+        // TransactionTemplate: safe to call from both the sync path (no open transaction,
+        // starts its own short tx) and the async worker path (starts its own short tx).
         transactionTemplate.executeWithoutResult(status -> {
             Conversation conversation = conversationRepository.findByExternalId(sessionId)
                     .orElseThrow(() -> new IllegalArgumentException("Conversation not found"));
@@ -483,7 +532,7 @@ public class AiAgentService {
             ChatMessageEntity userMsg = new ChatMessageEntity(conversation, "user", message);
             chatMessageRepository.save(userMsg);
 
-            String modelName = "opencode-default";
+            String modelName = (model == null || model.isBlank()) ? "opencode-default" : model;
             ChatMessageEntity assistantMsg = new ChatMessageEntity(conversation, "assistant", reply);
             assistantMsg.setTokensUsed(outputTokens);
             assistantMsg.setModelName(modelName);
@@ -525,8 +574,13 @@ public class AiAgentService {
                 .toList();
     }
 
-    @Transactional
-    public boolean clearConversation(String conversationId, User user) {
+    /**
+     * Clears a conversation. The upstream OpenCode session deletion (blocking network
+     * I/O) deliberately happens OUTSIDE any DB transaction; only the short persistence
+     * step is transactional. A missing or non-owned conversation is a 404 so the caller
+     * learns nothing about other users' conversation ids.
+     */
+    public void clearConversation(String conversationId, User user) {
         if (conversationId == null || conversationId.isBlank()) {
             throw new IllegalArgumentException("Conversation id must not be empty");
         }
@@ -535,27 +589,32 @@ public class AiAgentService {
                 .orElse(null);
 
         if (conversation == null || !conversation.getUser().getId().equals(user.getId())) {
-            return false;
+            throw new AiAgentException("Conversation not found", "NOT_FOUND", 404);
         }
 
-        // Delete from OpenCode
-        boolean cleared = false;
+        // Best-effort upstream cleanup outside any transaction (no DB connection is
+        // held across network I/O, and an upstream failure here must not roll back the
+        // conversation deletion).
         try {
-            cleared = opencodeClient.deleteSession(conversation.getOpencodeSessionId());
+            opencodeClient.deleteSession(conversation.getOpencodeSessionId());
         } catch (Exception e) {
-            log.warn("Failed to delete OpenCode session: {}", e.getMessage());
+            log.warn("Failed to delete OpenCode session {}: {}",
+                    conversation.getOpencodeSessionId(), e.getMessage());
         }
 
-        // Delete from database
-        chatMessageRepository.deleteByConversationExternalId(conversationId);
-        conversationRepository.deleteByExternalId(conversationId);
+        transactionTemplate.executeWithoutResult(status -> {
+            chatMessageRepository.deleteByConversationExternalId(conversationId);
+            conversationRepository.deleteByExternalId(conversationId);
+        });
 
-        log.info("Cleared conversation for session {}: cleared={}", conversationId, cleared);
-        return true;
+        log.info("Cleared conversation for session {}", conversationId);
     }
 
-    @Transactional
-    public boolean deleteMessage(String conversationId, Long messageId, User user) {
+    /**
+     * Deletes a single message. A missing or non-owned conversation/message surfaces
+     * as a 404 so the caller learns nothing about other users' conversation ids.
+     */
+    public void deleteMessage(String conversationId, Long messageId, User user) {
         if (conversationId == null || conversationId.isBlank()) {
             throw new IllegalArgumentException("Conversation id must not be empty");
         }
@@ -567,22 +626,25 @@ public class AiAgentService {
                 .orElse(null);
 
         if (conversation == null || !conversation.getUser().getId().equals(user.getId())) {
-            return false;
+            throw new AiAgentException("Conversation not found", "NOT_FOUND", 404);
         }
 
         ChatMessageEntity message = chatMessageRepository.findById(messageId).orElse(null);
 
         if (message == null || !message.getConversation().getId().equals(conversation.getId())) {
-            return false;
+            throw new AiAgentException("Message not found", "NOT_FOUND", 404);
         }
 
         chatMessageRepository.delete(message);
 
         log.info("Deleted message {} from conversation {}", messageId, conversationId);
-        return true;
     }
 
-    @Transactional
+    /**
+     * Starts a new conversation. The upstream OpenCode session is created BEFORE any
+     * persistence and outside a transaction, so no DB connection is held during the
+     * blocking network call; the row is saved by the repository's own transaction.
+     */
     public String newConversation(User user) {
         String opencodeSessionId = opencodeClient.createSession();
         String externalId = UUID.randomUUID().toString();
@@ -596,7 +658,7 @@ public class AiAgentService {
 
     @Transactional(readOnly = true)
     public List<ChatSessionInfo> getUserSessions(User user) {
-        return conversationRepository.findByUserIdOrderByUpdatedAtDesc(user.getId())
+        return conversationRepository.findByUserIdOrderByUpdatedAtDesc(user.getId(), PageRequest.of(0, 200))
                 .stream()
                 .map(c -> new ChatSessionInfo(c.getExternalId(), c.getTitle(), c.getUpdatedAt()))
                 .toList();
@@ -613,5 +675,12 @@ public class AiAgentService {
     }
 
     public record ChatSessionInfo(String conversationId, String title, LocalDateTime updatedAt) {
+    }
+
+    /**
+     * Result of a chat turn: the assistant reply plus the model that produced it
+     * (null when the server default is used, i.e. no model chain configured).
+     */
+    private record ModelReply(String reply, String model) {
     }
 }

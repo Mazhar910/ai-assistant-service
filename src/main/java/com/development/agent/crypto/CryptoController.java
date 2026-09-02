@@ -1,5 +1,6 @@
 package com.development.agent.crypto;
 
+import com.development.agent.exception.ErrorResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -35,7 +36,7 @@ public class CryptoController {
         String encryptedKey = body.get("encryptedKey");
         if (encryptedKey == null || encryptedKey.isBlank()) {
             return ResponseEntity.badRequest()
-                    .body(Map.of("error", "MISSING_KEY", "message", "encryptedKey is required"));
+                    .body(new ErrorResponse("MISSING_KEY", "encryptedKey is required", System.currentTimeMillis()));
         }
         try {
             String sessionId = keyStore.registerSession(encryptedKey);
@@ -44,7 +45,7 @@ public class CryptoController {
         } catch (Exception e) {
             log.warn("Handshake failed: {}", e.getMessage());
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                    .body(Map.of("error", "HANDSHAKE_FAILED", "message", "Could not establish session"));
+                    .body(new ErrorResponse("HANDSHAKE_FAILED", "Could not establish session", System.currentTimeMillis()));
         }
     }
 }

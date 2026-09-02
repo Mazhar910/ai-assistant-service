@@ -1,6 +1,7 @@
 package com.development.agent.controller;
 
 import com.development.agent.entity.User;
+import com.development.agent.exception.ErrorResponse;
 import com.development.agent.job.ChatJob;
 import com.development.agent.model.ChatMessage;
 import com.development.agent.model.ChatRequest;
@@ -34,11 +35,13 @@ public class AgentController {
     @PostMapping("/chat")
     public ChatResponse chat(@RequestBody ChatRequest request, @AuthenticationPrincipal User user) {
         long start = System.currentTimeMillis();
-        log.info("POST /api/agent/chat - conversationId={}, message={}, user={}",
-                request.getConversationId(), request.getMessage(), user.getUsername());
+        log.info("POST /api/agent/chat - conversationId={}, messageLength={}, user={}",
+                request.getConversationId(),
+                request.getMessage() == null ? 0 : request.getMessage().length(), user.getUsername());
         ChatResponse response = agentService.chat(request, user);
-        log.info("POST /api/agent/chat - completed in {} ms, conversationId={}, reply={}",
-                System.currentTimeMillis() - start, response.getConversationId(), response.getReply());
+        log.info("POST /api/agent/chat - completed in {} ms, conversationId={}, replyLength={}, model={}",
+                System.currentTimeMillis() - start, response.getConversationId(),
+                response.getReply() == null ? 0 : response.getReply().length(), response.getModel());
         return response;
     }
 
@@ -54,8 +57,9 @@ public class AgentController {
                 request.getConversationId(), user.getUsername());
         if (!chatJobService.isAsyncEnabled()) {
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
-                    .body(Map.of("error", "ASYNC_DISABLED",
-                            "message", "Asynchronous processing is not enabled on this instance."));
+                    .body(new ErrorResponse("ASYNC_DISABLED",
+                            "Asynchronous processing is not enabled on this instance.",
+                            System.currentTimeMillis()));
         }
         String jobId = chatJobService.submit(request, user);
         return ResponseEntity.accepted().body(Map.of(
@@ -71,11 +75,11 @@ public class AgentController {
         ChatJob job = chatJobService.get(jobId);
         if (job == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND)
-                    .body(Map.of("error", "JOB_NOT_FOUND", "message", "No such job: " + jobId));
+                    .body(new ErrorResponse("JOB_NOT_FOUND", "No such job: " + jobId, System.currentTimeMillis()));
         }
         if (!job.getUserId().equals(user.getId())) {
             return ResponseEntity.status(HttpStatus.FORBIDDEN)
-                    .body(Map.of("error", "ACCESS_DENIED", "message", "Access denied to this job"));
+                    .body(new ErrorResponse("ACCESS_DENIED", "Access denied to this job", System.currentTimeMillis()));
         }
         return ResponseEntity.ok(chatJobService.statusView(job, user));
     }
@@ -93,25 +97,27 @@ public class AgentController {
 
     @DeleteMapping("/conversation/{conversationId}")
     public Map<String, Boolean> clearConversation(@PathVariable String conversationId,
-                                                   @AuthenticationPrincipal User user) {
+                                                    @AuthenticationPrincipal User user) {
         long start = System.currentTimeMillis();
         log.info("DELETE /api/agent/conversation/{} user={}", conversationId, user.getUsername());
-        boolean cleared = agentService.clearConversation(conversationId, user);
-        log.info("DELETE /api/agent/conversation/{} - cleared={} in {} ms",
-                conversationId, cleared, System.currentTimeMillis() - start);
-        return Map.of("cleared", cleared);
+        // Missing or non-owned conversations throw AiAgentException(404) -> unified ErrorResponse.
+        agentService.clearConversation(conversationId, user);
+        log.info("DELETE /api/agent/conversation/{} - cleared in {} ms",
+                conversationId, System.currentTimeMillis() - start);
+        return Map.of("cleared", true);
     }
 
     @DeleteMapping("/conversation/{conversationId}/message/{messageId}")
     public Map<String, Boolean> deleteMessage(@PathVariable String conversationId,
-                                               @PathVariable Long messageId,
-                                               @AuthenticationPrincipal User user) {
+                                                @PathVariable Long messageId,
+                                                @AuthenticationPrincipal User user) {
         long start = System.currentTimeMillis();
         log.info("DELETE /api/agent/conversation/{}/message/{} user={}", conversationId, messageId, user.getUsername());
-        boolean deleted = agentService.deleteMessage(conversationId, messageId, user);
-        log.info("DELETE /api/agent/conversation/{}/message/{} - deleted={} in {} ms",
-                conversationId, messageId, deleted, System.currentTimeMillis() - start);
-        return Map.of("deleted", deleted);
+        // Missing or non-owned conversations/messages throw AiAgentException(404).
+        agentService.deleteMessage(conversationId, messageId, user);
+        log.info("DELETE /api/agent/conversation/{}/message/{} - deleted in {} ms",
+                conversationId, messageId, System.currentTimeMillis() - start);
+        return Map.of("deleted", true);
     }
 
     @PostMapping("/conversation")
