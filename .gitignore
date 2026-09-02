@@ -34,3 +34,6 @@ build/
 .idea/
 .mvn/
 logs/
+
+# Local development secrets (never commit)
+application-local.properties

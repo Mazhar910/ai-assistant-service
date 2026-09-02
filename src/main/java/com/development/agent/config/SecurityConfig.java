@@ -4,6 +4,7 @@ import com.development.agent.exception.ErrorResponse;
 import com.development.agent.security.JwtAuthFilter;
 import com.development.agent.security.RateLimitFilter;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.servlet.DispatcherType;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
@@ -48,6 +49,10 @@ public class SecurityConfig {
             .cors(cors -> {})
             .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
             .authorizeHttpRequests(auth -> {
+                // Re-invocation of the filter chain on async/SSE completion must NOT be
+                // re-authenticated or rejected (the security context is already established
+                // on the initial request thread).
+                auth.dispatcherTypeMatchers(DispatcherType.ASYNC, DispatcherType.ERROR).permitAll();
                 auth.requestMatchers("/api/auth/login", "/api/auth/register").permitAll();
                 auth.requestMatchers("/api/crypto/**").permitAll();
                 auth.requestMatchers(HttpMethod.OPTIONS, "/**").permitAll();

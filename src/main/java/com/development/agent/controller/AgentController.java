@@ -14,6 +14,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.List;
 import java.util.Map;
@@ -81,7 +82,20 @@ public class AgentController {
             return ResponseEntity.status(HttpStatus.FORBIDDEN)
                     .body(new ErrorResponse("ACCESS_DENIED", "Access denied to this job", System.currentTimeMillis()));
         }
-        return ResponseEntity.ok(chatJobService.statusView(job, user));
+        return ResponseEntity.ok(chatJobService.statusView(job));
+    }
+
+    /**
+     * Server-Sent Events stream for a job. The client connects with its Bearer token
+     * (via fetch, not EventSource, so the header can be sent) and receives a {@code status}
+     * event immediately (current snapshot) and again when the job reaches a terminal state,
+     * at which point the connection is closed. Use as the primary mechanism; fall back to
+     * {@code /jobs/{jobId}/status} polling for clients that cannot or do not want to stream.
+     */
+    @GetMapping(value = "/jobs/{jobId}/stream", produces = "text/event-stream")
+    public SseEmitter jobStream(@PathVariable String jobId,
+                                @AuthenticationPrincipal User user) {
+        return chatJobService.stream(jobId, user);
     }
 
     @GetMapping("/conversation/{conversationId}")

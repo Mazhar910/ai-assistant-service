@@ -5,7 +5,9 @@ import com.development.agent.exception.AiAgentException;
 import com.development.agent.job.ChatJob;
 import com.development.agent.job.ChatJobQueue;
 import com.development.agent.job.InMemoryChatJobQueue;
+import com.development.agent.job.JobStreamNotifier;
 import com.development.agent.model.ChatRequest;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,6 +35,7 @@ public class ChatJobService {
 
     private final ChatJobQueue jobQueue;
     private final AiAgentService aiAgentService;
+    private final JobStreamNotifier jobStreamNotifier;
 
     @Value("${ai.opencode.async:false}")
     private boolean asyncEnabled;
@@ -43,9 +46,11 @@ public class ChatJobService {
     @Value("${app.async.retry-base-delay-ms:2000}")
     private long retryBaseDelayMs;
 
-    public ChatJobService(ChatJobQueue jobQueue, AiAgentService aiAgentService) {
+    public ChatJobService(ChatJobQueue jobQueue, AiAgentService aiAgentService,
+                          JobStreamNotifier jobStreamNotifier) {
         this.jobQueue = jobQueue;
         this.aiAgentService = aiAgentService;
+        this.jobStreamNotifier = jobStreamNotifier;
     }
 
     @PostConstruct
@@ -95,6 +100,9 @@ public class ChatJobService {
             job.setState(ChatJob.State.FAILED);
             job.setError("PROCESSING_FAILED", e.getMessage());
             log.error("AI job {} failed: {}", job.getJobId(), e.getMessage());
+        } finally {
+            // Always publish the terminal state so any SSE subscriber is released.
+            jobStreamNotifier.publishTerminal(job.getJobId(), statusView(job));
         }
     }
 
@@ -131,8 +139,31 @@ public class ChatJobService {
         }
     }
 
+    /**
+     * Opens a Server-Sent Events stream for a job's status. Enforces that the
+     * requesting user owns the job (404 if the job is unknown, 403 otherwise) and
+     * registers a subscriber that is released exactly once on completion/timeout.
+     * The returned emitter should be returned directly from the controller method.
+     */
+    public SseEmitter stream(String jobId, User user) {
+        ChatJob job = jobQueue.get(jobId);
+        if (job == null) {
+            throw new AiAgentException("No such job: " + jobId, "JOB_NOT_FOUND", 404);
+        }
+        if (!job.getUserId().equals(user.getId())) {
+            throw new AiAgentException("Access denied to this job", "ACCESS_DENIED", 403);
+        }
+        boolean terminal = isTerminal(job);
+        return jobStreamNotifier.subscribe(jobId, statusView(job), terminal);
+    }
+
+    private static boolean isTerminal(ChatJob job) {
+        ChatJob.State state = job.getState();
+        return state == ChatJob.State.COMPLETED || state == ChatJob.State.FAILED;
+    }
+
     /** Serializable status view for the API (never exposes internal internals). */
-    public Map<String, Object> statusView(ChatJob job, User user) {
+    public Map<String, Object> statusView(ChatJob job) {
         Map<String, Object> view = new LinkedHashMap<>();
         view.put("jobId", job.getJobId());
         view.put("conversationId", job.getConversationId());
