@@ -15,17 +15,23 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Per-key rate limiter using a fixed-window sliding counter. Keyed by the
+ * Per-key rate limiter using a sliding-window counter. Keyed by the
  * authenticated user id when a valid Bearer token is present, otherwise by the
  * client IP (covers login/register endpoints which are unauthenticated).
+ *
+ * The sliding window tracks the timestamps of recent requests per key, pruning
+ * those outside the window on each call, so bursts at a window boundary are
+ * smoothed out (a fixed-window counter would allow 2x the limit in a 2-second
+ * span). Bounded memory: a janitor thread drops keys whose window fully elapsed.
  *
  * Protects the API from abuse and bursty traffic when scaling. In-memory for a
  * single node; a distributed limiter (Redis) can replace it for multi-node scale.
@@ -41,8 +47,8 @@ public class RateLimitFilter extends OncePerRequestFilter {
     @Value("${app.security.rate-limit-per-minute:0}")
     private int rateLimitPerMinute;
 
-    /** key -> long[]{windowStartMillis, count} */
-    private final ConcurrentHashMap<String, long[]> buckets = new ConcurrentHashMap<>();
+    /** key -> deque of recent request timestamps (within the current window, sorted ascending) */
+    private final ConcurrentHashMap<String, Deque<Long>> buckets = new ConcurrentHashMap<>();
     private final ScheduledExecutorService janitor;
 
     private static final long WINDOW_MS = 60_000L;
@@ -63,10 +69,14 @@ public class RateLimitFilter extends OncePerRequestFilter {
     private void sweepStaleBuckets() {
         long now = System.currentTimeMillis();
         int removed = 0;
-        for (Map.Entry<String, long[]> entry : buckets.entrySet()) {
-            if (now - entry.getValue()[0] >= WINDOW_MS) {
-                buckets.remove(entry.getKey(), entry.getValue());
-                removed++;
+        for (Map.Entry<String, Deque<Long>> entry : buckets.entrySet()) {
+            Deque<Long> timestamps = entry.getValue();
+            Long oldest = timestamps.peekFirst();
+            if (oldest != null && now - oldest >= WINDOW_MS) {
+                // The whole window has elapsed, so the key can be dropped.
+                if (buckets.remove(entry.getKey(), timestamps)) {
+                    removed++;
+                }
             }
         }
         if (removed > 0) {
@@ -96,7 +106,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
 
         String key = resolveKey(request);
         if (!allow(key)) {
-            log.warn("Rate limit exceeded for key {}", key);
+            log.debug("Rate limit exceeded for key {}", key);
             ErrorResponse error = new ErrorResponse("RATE_LIMITED",
                     "Too many requests. Please slow down and try again later.", System.currentTimeMillis());
             response.setStatus(429);
@@ -124,25 +134,26 @@ public class RateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
-     * Fixed-window counter, updated atomically per key via {@code compute} so requests
-     * for different keys never contend on a shared lock.
+     * Sliding-window counter: prunes timestamps older than the window, then allows
+     * the request if the count within the window is below the limit. Each key is
+     * guarded by {@code compute} so requests for the same key are serialized while
+     * different keys never contend on a shared lock.
      */
     private boolean allow(String key) {
         long now = System.currentTimeMillis();
-        AtomicBoolean allowed = new AtomicBoolean(false);
-        buckets.compute(key, (k, bucket) -> {
-            if (bucket == null || now - bucket[0] >= WINDOW_MS) {
-                allowed.set(true);
-                return new long[]{now, 1};
+        boolean[] allowed = {false};
+        buckets.compute(key, (k, existing) -> {
+            Deque<Long> deque = (existing == null) ? new ArrayDeque<>() : existing;
+            // Drop timestamps that have left the sliding window.
+            while (!deque.isEmpty() && now - deque.peekFirst() >= WINDOW_MS) {
+                deque.pollFirst();
             }
-            if (bucket[1] >= rateLimitPerMinute) {
-                allowed.set(false);
-                return bucket;
+            if (deque.size() < rateLimitPerMinute) {
+                deque.addLast(now);
+                allowed[0] = true;
             }
-            bucket[1]++;
-            allowed.set(true);
-            return bucket;
+            return deque;
         });
-        return allowed.get();
+        return allowed[0];
     }
 }

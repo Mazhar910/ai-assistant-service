@@ -29,6 +29,9 @@ public class User {
 
     private String activeToken;
 
+    /** Single rotating refresh token (paired with activeToken for one-active-session-per-user). */
+    private String refreshToken;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt = LocalDateTime.now();
 
@@ -68,6 +71,9 @@ public class User {
 
     public String getActiveToken() { return activeToken; }
     public void setActiveToken(String activeToken) { this.activeToken = activeToken; }
+
+    public String getRefreshToken() { return refreshToken; }
+    public void setRefreshToken(String refreshToken) { this.refreshToken = refreshToken; }
 
     public LocalDateTime getCreatedAt() { return createdAt; }
     public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }

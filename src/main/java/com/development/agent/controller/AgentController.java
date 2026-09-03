@@ -8,6 +8,7 @@ import com.development.agent.model.ChatRequest;
 import com.development.agent.model.ChatResponse;
 import com.development.agent.service.AiAgentService;
 import com.development.agent.service.ChatJobService;
+import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -16,6 +17,7 @@ import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import jakarta.servlet.http.HttpServletResponse;
 import java.util.List;
 import java.util.Map;
 
@@ -34,7 +36,7 @@ public class AgentController {
     }
 
     @PostMapping("/chat")
-    public ChatResponse chat(@RequestBody ChatRequest request, @AuthenticationPrincipal User user) {
+    public ChatResponse chat(@Valid @RequestBody ChatRequest request, @AuthenticationPrincipal User user) {
         long start = System.currentTimeMillis();
         log.info("POST /api/agent/chat - conversationId={}, messageLength={}, user={}",
                 request.getConversationId(),
@@ -52,7 +54,7 @@ public class AgentController {
      * blocking an HTTP thread on upstream AI inference (scale-ready).
      */
     @PostMapping("/chat/async")
-    public ResponseEntity<?> chatAsync(@RequestBody ChatRequest request,
+    public ResponseEntity<?> chatAsync(@Valid @RequestBody ChatRequest request,
                                        @AuthenticationPrincipal User user) {
         log.info("POST /api/agent/chat/async - conversationId={}, user={}",
                 request.getConversationId(), user.getUsername());
@@ -94,7 +96,12 @@ public class AgentController {
      */
     @GetMapping(value = "/jobs/{jobId}/stream", produces = "text/event-stream")
     public SseEmitter jobStream(@PathVariable String jobId,
-                                @AuthenticationPrincipal User user) {
+                                @AuthenticationPrincipal User user,
+                                HttpServletResponse response) {
+        // SSE must never be cached or buffered: no-cache (an EventSource-style stream is
+        // consumed incrementally) and X-Accel-Buffering: no (disable reverse-proxy buffering).
+        response.setHeader("Cache-Control", "no-cache");
+        response.setHeader("X-Accel-Buffering", "no");
         return chatJobService.stream(jobId, user);
     }
 

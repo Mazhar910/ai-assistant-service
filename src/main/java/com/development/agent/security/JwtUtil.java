@@ -14,9 +14,11 @@ public class JwtUtil {
 
     private final SecretKey key;
     private final long expirationMs;
+    private final long refreshExpirationMs;
 
     public JwtUtil(@Value("${app.jwt.secret}") String secret,
-                   @Value("${app.jwt.expiration-ms}") long expirationMs) {
+                   @Value("${app.jwt.expiration-ms}") long expirationMs,
+                   @Value("${app.jwt.refresh-expiration-ms}") long refreshExpirationMs) {
         if (secret == null || secret.isBlank()) {
             throw new IllegalStateException(
                     "app.jwt.secret is not configured. Set the JWT_SECRET environment variable to a " +
@@ -37,15 +39,31 @@ public class JwtUtil {
         }
         this.key = Keys.hmacShaKeyFor(keyBytes);
         this.expirationMs = expirationMs;
+        this.refreshExpirationMs = refreshExpirationMs;
     }
 
+    private static final String TYPE_CLAIM = "type";
+    private static final String TYPE_ACCESS = "access";
+    private static final String TYPE_REFRESH = "refresh";
+
+    /** Short-lived access token used in the Authorization header for authenticated requests. */
     public String generateToken(Long userId, String username, String role) {
+        return build(userId, username, role, TYPE_ACCESS, expirationMs);
+    }
+
+    /** Longer-lived refresh token, used only at POST /api/auth/refresh to rotate the session. */
+    public String generateRefreshToken(Long userId, String username, String role) {
+        return build(userId, username, role, TYPE_REFRESH, refreshExpirationMs);
+    }
+
+    private String build(Long userId, String username, String role, String type, long ttlMs) {
         return Jwts.builder()
                 .subject(String.valueOf(userId))
                 .claim("username", username)
                 .claim("role", role)
+                .claim(TYPE_CLAIM, type)
                 .issuedAt(new Date())
-                .expiration(new Date(System.currentTimeMillis() + expirationMs))
+                .expiration(new Date(System.currentTimeMillis() + ttlMs))
                 .signWith(key)
                 .compact();
     }
@@ -58,10 +76,25 @@ public class JwtUtil {
                 .getPayload();
     }
 
+    /** True if the token is a syntactically valid REFRESH token (correct type claim, not expired). */
+    public boolean validateRefreshToken(String token) {
+        return validate(token, TYPE_REFRESH);
+    }
+
+    /** True if the token is a syntactically valid ACCESS token (correct type claim, not expired). */
+    public boolean validateAccessToken(String token) {
+        return validate(token, TYPE_ACCESS);
+    }
+
+    /** Backwards-compatible: accepts any well-formed non-expired token (used by older callers). */
     public boolean validateToken(String token) {
+        return validate(token, null);
+    }
+
+    private boolean validate(String token, String expectedType) {
         try {
-            parseToken(token);
-            return true;
+            Claims claims = parseToken(token);
+            return expectedType == null || expectedType.equals(claims.get(TYPE_CLAIM, String.class));
         } catch (JwtException | IllegalArgumentException e) {
             return false;
         }

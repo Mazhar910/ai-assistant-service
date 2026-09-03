@@ -53,7 +53,7 @@ public class SecurityConfig {
                 // re-authenticated or rejected (the security context is already established
                 // on the initial request thread).
                 auth.dispatcherTypeMatchers(DispatcherType.ASYNC, DispatcherType.ERROR).permitAll();
-                auth.requestMatchers("/api/auth/login", "/api/auth/register").permitAll();
+                auth.requestMatchers("/api/auth/login", "/api/auth/register", "/api/auth/refresh").permitAll();
                 auth.requestMatchers("/api/crypto/**").permitAll();
                 auth.requestMatchers(HttpMethod.OPTIONS, "/**").permitAll();
                 auth.requestMatchers("/api/admin/**").hasRole("ADMIN");
@@ -107,7 +107,8 @@ public class SecurityConfig {
 
     @Bean
     public PasswordEncoder passwordEncoder() {
-        return new BCryptPasswordEncoder();
+        // Cost factor 12 (OWASP recommendation) balances strength vs. login latency.
+        return new BCryptPasswordEncoder(12);
     }
 
     @Bean

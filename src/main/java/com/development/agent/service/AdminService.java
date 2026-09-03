@@ -22,6 +22,11 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.LocalDateTime;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 @Service
@@ -29,6 +34,9 @@ public class AdminService {
 
     /** Upper bound for the backward-compatible (non-paginated) user list endpoint. */
     private static final int MAX_PLAIN_USER_LIST = 200;
+
+    /** How long user deletion waits for best-effort upstream session cleanup to drain. */
+    private static final long DELETE_CLEANUP_TIMEOUT_SECONDS = 30;
 
     private static final Logger log = LoggerFactory.getLogger(AdminService.class);
 
@@ -39,6 +47,8 @@ public class AdminService {
     private final UserCache userCache;
     private final OpencodeClient opencodeClient;
     private final TransactionTemplate transactionTemplate;
+    private final ExecutorService cleanupExecutor;
+    private final AtomicBoolean cleanupExecutorShutdown = new AtomicBoolean(false);
 
     public AdminService(UserRepository userRepository,
                         ConversationRepository conversationRepository,
@@ -54,6 +64,20 @@ public class AdminService {
         this.userCache = userCache;
         this.opencodeClient = opencodeClient;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
+        // Dedicated, bounded pool for user-deletion cleanup so blocking upstream calls
+        // never contend with the JVM common pool (used by repository aggregate queries).
+        this.cleanupExecutor = Executors.newFixedThreadPool(8, r -> {
+            Thread t = new Thread(r, "user-delete-cleanup-" + r.hashCode());
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
+    @jakarta.annotation.PreDestroy
+    void shutdownCleanupExecutor() {
+        if (cleanupExecutorShutdown.compareAndSet(false, true)) {
+            cleanupExecutor.shutdownNow();
+        }
     }
 
     /** Backward-compatible plain list, bounded to avoid unbounded responses. */
@@ -183,14 +207,30 @@ public class AdminService {
 
         // Best-effort upstream cleanup outside any transaction: no DB connection is held
         // across network I/O, and an upstream failure here must not roll back the deletion.
+        // The calls are independent blocking I/O, so run them concurrently on a dedicated
+        // bounded pool (not the common pool) to avoid slowing user deletion for many sessions.
+        List<CompletableFuture<Void>> cleanups = new ArrayList<>();
         for (Conversation c : convos) {
-            if (c.getOpencodeSessionId() != null && !c.getOpencodeSessionId().isBlank()) {
+            String ocSession = c.getOpencodeSessionId();
+            if (ocSession == null || ocSession.isBlank()) {
+                continue;
+            }
+            cleanups.add(CompletableFuture.runAsync(() -> {
                 try {
-                    opencodeClient.deleteSession(c.getOpencodeSessionId());
+                    opencodeClient.deleteSession(ocSession);
                 } catch (Exception e) {
                     log.warn("Could not delete opencode session {} while deleting user {}: {}",
-                            c.getOpencodeSessionId(), userId, e.getMessage());
+                            ocSession, userId, e.getMessage());
                 }
+            }, cleanupExecutor));
+        }
+        if (!cleanups.isEmpty()) {
+            try {
+                CompletableFuture.allOf(cleanups.toArray(new CompletableFuture[0]))
+                        .get(DELETE_CLEANUP_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                log.warn("Timed out waiting for upstream opencode session cleanup for user {}: {}",
+                        userId, e.getMessage());
             }
         }
 

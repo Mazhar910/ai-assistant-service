@@ -24,7 +24,9 @@ public class CorsConfig {
         CorsConfiguration config = new CorsConfiguration();
         config.setAllowedOrigins(allowedOrigins);
         config.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
-        config.setAllowedHeaders(List.of("*"));
+        // Restrict to the headers the app actually sends rather than a wildcard, so
+        // arbitrary request headers are not permitted in CORS preflight.
+        config.setAllowedHeaders(List.of("Content-Type", "Authorization", "X-Session-Id", "X-Auth-Enc"));
         config.setAllowCredentials(true);
         config.setMaxAge(3600L);
 

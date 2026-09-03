@@ -50,7 +50,7 @@ public class JwtAuthFilter extends OncePerRequestFilter {
         if (header != null && header.startsWith("Bearer ")) {
             String token = header.substring(7);
             try {
-                if (jwtUtil.validateToken(token)) {
+                if (jwtUtil.validateAccessToken(token)) {
                     Long userId = jwtUtil.getUserId(token);
 
                     // Cache-first lookup: read-heavy requests avoid a DB hit per request.

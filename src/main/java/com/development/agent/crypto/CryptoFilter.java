@@ -14,6 +14,7 @@ import jakarta.servlet.http.HttpServletResponseWrapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.annotation.Order;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpMethod;
 import org.springframework.stereotype.Component;
 
@@ -52,6 +53,9 @@ public class CryptoFilter implements Filter {
 
     private final CryptoKeyStore keyStore;
 
+    @Value("${app.crypto.enabled:true}")
+    private boolean cryptoEnabled;
+
     public CryptoFilter(CryptoKeyStore keyStore) {
         this.keyStore = keyStore;
     }
@@ -62,6 +66,13 @@ public class CryptoFilter implements Filter {
                          FilterChain chain) throws IOException, ServletException {
         HttpServletRequest httpReq = (HttpServletRequest) request;
         HttpServletResponse httpResp = (HttpServletResponse) response;
+
+        // When application-layer encryption is disabled (app.crypto.enabled=false) the
+        // traffic is plaintext and secured only by TLS/JWT, so pass everything through.
+        if (!cryptoEnabled) {
+            chain.doFilter(request, response);
+            return;
+        }
 
         // Application-layer crypto only applies to the initial REQUEST. Async/error
         // re-dispatches (e.g. the async dispatch that drives SSE completion, or the

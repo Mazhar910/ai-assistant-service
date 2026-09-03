@@ -27,6 +27,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -39,6 +40,8 @@ public class AiAgentService {
 
     private static final int SUGGESTIONS_PER_VIEW = 4;
     private static final int SUGGESTIONS_BATCH_SIZE = 16;
+    /** Upper bound on messages served by the conversation history endpoint. */
+    private static final int RECENT_CONVERSATION_MESSAGES = 500;
 
     private static final String SYSTEM_PROMPT =
             "You are a general-purpose AI assistant that answers questions on any topic accurately and helpfully. " +
@@ -568,8 +571,13 @@ public class AiAgentService {
         }
 
         log.info("Fetching conversation history for session {}", conversationId);
-        return chatMessageRepository.findByConversationExternalIdOrderByCreatedAtAsc(conversationId)
+        // Return the most recent window (newest-to-oldest then reversed to chronological),
+        // bounding the response for very long conversations while keeping the List contract.
+        return chatMessageRepository
+                .findByConversationExternalIdOrderByCreatedAtDesc(conversationId,
+                        PageRequest.of(0, RECENT_CONVERSATION_MESSAGES))
                 .stream()
+                .sorted(Comparator.comparing(ChatMessageEntity::getCreatedAt))
                 .map(m -> new ChatMessage(m.getRole(), m.getContent()))
                 .toList();
     }
@@ -670,8 +678,21 @@ public class AiAgentService {
     }
 
     private int estimateTokens(String text) {
-        if (text == null) return 0;
-        return Math.max(1, text.length() / 4);
+        if (text == null || text.isEmpty()) return 0;
+        long cjk = text.codePoints().filter(AiAgentService::isCjk).count();
+        long latin = text.codePoints().count() - cjk;
+        // CJK characters are roughly one token each; Latin text ~4 chars per token.
+        return (int) Math.max(1L, (latin / 4) + cjk);
+    }
+
+    /** True for CJK ideographs/kana/hangul (and CJK punctuation): ~1 token per char. */
+    private static boolean isCjk(int cp) {
+        return (cp >= 0x3040 && cp <= 0x30FF)      // Hiragana + Katakana
+                || (cp >= 0x3400 && cp <= 0x4DBF)  // CJK Ext A
+                || (cp >= 0x4E00 && cp <= 0x9FFF)  // CJK Unified Ideographs
+                || (cp >= 0xAC00 && cp <= 0xD7AF)  // Hangul
+                || (cp >= 0x3000 && cp <= 0x303F)  // CJK punctuation
+                || (cp >= 0xFF00 && cp <= 0xFFEF); // full-width forms
     }
 
     public record ChatSessionInfo(String conversationId, String title, LocalDateTime updatedAt) {

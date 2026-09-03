@@ -57,18 +57,20 @@ public class AuthService {
                 passwordEncoder.encode(request.getPassword())
         );
 
-        // Persist first so the user has a real ID, then issue the token,
-        // then save again to store the activeToken. Generating the token before
+        // Persist first so the user has a real ID, then issue the tokens,
+        // then save again to store them. Generating the tokens before
         // save produced a "null" subject (user.getId() was null) and broke the
         // first authenticated request after signup.
         user = userRepository.save(user);
         String token = jwtUtil.generateToken(user.getId(), user.getUsername(), user.getRole().name());
+        String refresh = jwtUtil.generateRefreshToken(user.getId(), user.getUsername(), user.getRole().name());
         user.setActiveToken(token);
+        user.setRefreshToken(refresh);
         userRepository.save(user);
         userCache.invalidate(user.getId());
 
         log.info("User '{}' registered successfully with role '{}'", user.getUsername(), user.getRole());
-        return AuthResponse.success(token, user.getUsername(), user.getRole().name());
+        return AuthResponse.success(token, refresh, user.getUsername(), user.getRole().name());
     }
 
     public AuthResponse login(LoginRequest request) {
@@ -83,21 +85,54 @@ public class AuthService {
             throw new AiAgentException("Account has been disabled by admin", "ACCOUNT_DISABLED", 403);
         }
 
-        // Single session: invalidate previous token
+        // Single session: invalidate previous access + refresh tokens and issue a new pair.
         String newToken = jwtUtil.generateToken(user.getId(), user.getUsername(), user.getRole().name());
+        String newRefresh = jwtUtil.generateRefreshToken(user.getId(), user.getUsername(), user.getRole().name());
         user.setActiveToken(newToken);
+        user.setRefreshToken(newRefresh);
         userRepository.save(user);
         // Refresh cached user so the new activeToken is honored immediately
         userCache.put(user.getId(), user);
 
         log.info("User '{}' logged in successfully (single session enforced)", user.getUsername());
-        return AuthResponse.success(newToken, user.getUsername(), user.getRole().name());
+        return AuthResponse.success(newToken, newRefresh, user.getUsername(), user.getRole().name());
     }
 
     public void logout(User user) {
         user.setActiveToken(null);
+        user.setRefreshToken(null);
         userRepository.save(user);
         userCache.invalidate(user.getId());
         log.info("User '{}' logged out", user.getUsername());
+    }
+
+    /**
+     * Exchanges a still-valid refresh token for a fresh access token (and a rotated
+     * refresh token), keeping the user's session alive past the short-lived access
+     * window. The supplied refresh token must match the one stored for the user
+     * (single active session), otherwise the request is rejected.
+     */
+    @Transactional
+    public AuthResponse refresh(String refreshToken) {
+        if (!jwtUtil.validateRefreshToken(refreshToken)) {
+            throw new AiAgentException("Invalid or expired refresh token", "INVALID_REFRESH_TOKEN", 401);
+        }
+        Long userId = jwtUtil.getUserId(refreshToken);
+        User user = userRepository.findById(userId).orElse(null);
+        if (user == null || !user.isEnabled()) {
+            throw new AiAgentException("Invalid or expired refresh token", "INVALID_REFRESH_TOKEN", 401);
+        }
+        // Rotate only if the presented refresh token matches the currently stored one.
+        if (refreshToken.equals(user.getRefreshToken())) {
+            String newToken = jwtUtil.generateToken(user.getId(), user.getUsername(), user.getRole().name());
+            String newRefresh = jwtUtil.generateRefreshToken(user.getId(), user.getUsername(), user.getRole().name());
+            user.setActiveToken(newToken);
+            user.setRefreshToken(newRefresh);
+            userRepository.save(user);
+            userCache.invalidate(user.getId());
+            return AuthResponse.success(newToken, newRefresh, user.getUsername(), user.getRole().name());
+        }
+        // A stale or replayed refresh token: treat the whole session as compromised.
+        throw new AiAgentException("Invalid or expired refresh token", "INVALID_REFRESH_TOKEN", 401);
     }
 }

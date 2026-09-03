@@ -21,6 +21,7 @@ import java.security.KeyPairGenerator;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.spec.MGF1ParameterSpec;
+import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
 import java.util.Map;
@@ -30,6 +31,10 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 
 /**
  * Holds the server RSA keypair and the per-session AES keys established during the
@@ -65,17 +70,57 @@ public class CryptoKeyStore {
     @Value("${app.crypto.session-ttl-seconds:3600}")
     private long sessionTtlSeconds;
 
+    @Value("${app.crypto.keypair-path:}")
+    private String keypairPath;
+
+    /**
+     * Loads an existing RSA keypair from {@code app.crypto.keypair-path} when configured,
+     * otherwise generates a fresh one. Persisting the keypair lets the server restart
+     * without invalidating established sessions (the disruptive default behaviour is to
+     * regenerate on every boot).
+     */
     public CryptoKeyStore() {
         try {
-            KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
-            generator.initialize(2048);
-            KeyPair pair = generator.generateKeyPair();
+            KeyPair pair = loadOrCreateKeyPair();
             this.privateKey = pair.getPrivate();
             this.publicKey = pair.getPublic();
-            log.info("CryptoKeyStore initialized with RSA-2048 keypair");
+            log.info("CryptoKeyStore initialized with RSA-2048 keypair ({})",
+                    keypairPath == null || keypairPath.isBlank() ? "in-memory, regenerated on restart" : keypairPath);
         } catch (Exception e) {
             throw new IllegalStateException("Could not initialize RSA keypair", e);
         }
+    }
+
+    private KeyPair loadOrCreateKeyPair() throws Exception {
+        if (keypairPath == null || keypairPath.isBlank()) {
+            return generateKeyPair();
+        }
+        Path privFile = Paths.get(keypairPath + ".pkcs8");
+        Path pubFile = Paths.get(keypairPath + ".pub.der");
+        if (Files.exists(privFile) && Files.exists(pubFile)) {
+            byte[] privEnc = Files.readAllBytes(privFile);
+            byte[] pubEnc = Files.readAllBytes(pubFile);
+            PrivateKey priv = KeyFactory.getInstance("RSA")
+                    .generatePrivate(new PKCS8EncodedKeySpec(privEnc));
+            PublicKey pub = KeyFactory.getInstance("RSA")
+                    .generatePublic(new X509EncodedKeySpec(pubEnc));
+            return new KeyPair(pub, priv);
+        }
+        KeyPair generated = generateKeyPair();
+        Path parent = privFile.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        Files.write(privFile, generated.getPrivate().getEncoded());
+        Files.write(pubFile, generated.getPublic().getEncoded());
+        log.info("Persisted generated RSA keypair to {}", keypairPath);
+        return generated;
+    }
+
+    private KeyPair generateKeyPair() throws Exception {
+        KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+        generator.initialize(2048);
+        return generator.generateKeyPair();
     }
 
     public String publicKeyPem() {

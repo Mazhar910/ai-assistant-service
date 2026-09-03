@@ -17,8 +17,13 @@ The companion frontend lives in `../ai-agent-ui`.
   pool so HTTP threads are never blocked.
 - **Conversation management** — create, read, clear, and delete messages; session history and an
   AI-generated welcome-suggestions endpoint.
-- **Crypto session layer** — RSA handshake + per-session AES encryption for client traffic.
-- **Rate limiting** (per-user, token bucket) and unified JSON error responses.
+- **Crypto session layer** — RSA handshake + per-session AES encryption for client traffic
+  (feature-flagged via `app.crypto.enabled`, default true; keypair persisted via `app.crypto.keypair-path`).
+- **JWT refresh tokens** — short-lived access tokens + long-lived refresh tokens rotated at `/api/auth/refresh`.
+- **Rate limiting** (per-user, sliding window) and unified JSON error responses.
+- **Actuator** — `health`, `info`, `metrics`, `ready`, `liveness` endpoints exposed at `/actuator`.
+- **Graceful shutdown** — `server.shutdown=graceful` drains in-flight requests (including SSE heartbeats)
+  before shutdown completes.
 - **Admin API** — user listing (paginated), enable/disable, role changes, deletion (with upstream
   cleanup), and aggregate + per-user usage stats.
 - **Open Session In View is disabled**; all lazy-loading is scoped to explicit transactions and
@@ -68,6 +73,8 @@ Optional bootstrap variables:
 | `RATE_LIMIT_PER_MINUTE`               | `60`               | Per-user rate limit (0 disables)                    |
 | `H2_CONSOLE_ENABLED`                  | `false`            | Enable the H2 console (local dev only, localhost-bound) |
 | `CORS_ALLOWED_ORIGINS` / `app.cors.allowed-origins` | dev origins | Comma-separated allowed browser origins. **Override for production.** |
+| `CRYPTO_ENABLED` / `app.crypto.enabled` | `true` | Toggle application-layer AES encryption on/off. Disable for plaintext-over-TLS deployments. |
+| `CRYPTO_KEYPAIR_PATH` / `app.crypto.keypair-path` | *(in-memory)* | Persist the RSA keypair to survive restarts. Set to a filesystem path (e.g. `{config}/crypto-keypair`) to avoid invalidating sessions on reboot. |
 | `AI_ASYNC-retry` (see below)          | —                  | Async job retry tuning (see below)                  |
 
 ### Async job tuning (`application.properties`)
@@ -137,6 +144,7 @@ Base path: `http://localhost:8080`. JSON error responses use a unified shape:
 |--------|------------|------------------------------------------------------|
 | POST   | `/register`| Register a user (201/200 with `AuthResponse`)        |
 | POST   | `/login`   | Log in, returns the JWT (`AuthResponse`)             |
+| POST   | `/refresh` | Exchange a refresh token for a new access/refresh pair |
 | POST   | `/logout`  | Log out (authenticated)                              |
 | GET    | `/me`      | Current user profile (authenticated)                 |
 
@@ -149,6 +157,7 @@ Authenticated requests send `Authorization: Bearer <token>`.
 | POST   | `/chat`                | Synchronous chat turn → `ChatResponse` (`conversationId`, `reply`, `timestamp`, `model?`) |
 | POST   | `/chat/async`          | Submit async turn → `{ jobId, state, message }` (202) |
 | GET    | `/jobs/{jobId}/status` | Poll an async job → `ChatJobStatus` |
+| GET    | `/jobs/{jobId}/stream` | SSE stream for async job status (exempt from crypto layer) |
 | GET    | `/conversation/{id}`   | Message history for a conversation (ownership enforced) |
 | POST   | `/conversation`        | Create a new conversation → `{ conversationId }` |
 | DELETE | `/conversation/{id}`   | Clear a conversation (200 `{ cleared: true }`) |

@@ -30,10 +30,15 @@ class CryptoFilterTest {
     private CryptoFilter filter;
 
     @BeforeEach
-    void setUp() {
+    void setUp() throws Exception {
         keyStore = mock(CryptoKeyStore.class);
         filter = new CryptoFilter(keyStore);
         when(keyStore.keyFor(any())).thenReturn(Optional.empty());
+        // The filter is constructed directly (no Spring), so inject the enabled flag
+        // that would normally come from app.crypto.enabled.
+        var field = CryptoFilter.class.getDeclaredField("cryptoEnabled");
+        field.setAccessible(true);
+        field.setBoolean(filter, true);
     }
 
     @Test
@@ -85,6 +90,24 @@ class CryptoFilterTest {
 
         // Error dispatches (e.g. an SseEmitter timeout reaching the error dispatch)
         // must be served plaintext via the exception handler, never re-encrypted.
+        verify(chain).doFilter(req, resp);
+        verify(resp, never()).setStatus(400);
+    }
+
+    @Test
+    void disabledCryptoPassesEverythingThrough() throws Exception {
+        // Feature flag off: encryption is bypassed entirely, even for non-stream paths
+        // and even without a crypto session (traffic secured by TLS/JWT instead).
+        HttpServletRequest req = request("/api/agent/chat", DispatcherType.REQUEST, "POST");
+        HttpServletResponse resp = response();
+        FilterChain chain = mock(FilterChain.class);
+
+        var field = CryptoFilter.class.getDeclaredField("cryptoEnabled");
+        field.setAccessible(true);
+        field.setBoolean(filter, false);
+
+        filter.doFilter(req, resp, chain);
+
         verify(chain).doFilter(req, resp);
         verify(resp, never()).setStatus(400);
     }

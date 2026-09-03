@@ -2,6 +2,7 @@ package com.development.agent.controller;
 
 import com.development.agent.dto.AuthResponse;
 import com.development.agent.dto.LoginRequest;
+import com.development.agent.dto.RefreshTokenRequest;
 import com.development.agent.dto.RegisterRequest;
 import com.development.agent.entity.User;
 import com.development.agent.service.AuthService;
@@ -37,6 +38,11 @@ public class AuthController {
     @PostMapping("/login")
     public ResponseEntity<AuthResponse> login(@Valid @RequestBody LoginRequest request) {
         return ResponseEntity.ok(authService.login(request));
+    }
+
+    @PostMapping("/refresh")
+    public ResponseEntity<AuthResponse> refresh(@Valid @RequestBody RefreshTokenRequest request) {
+        return ResponseEntity.ok(authService.refresh(request.getRefreshToken()));
     }
 
     @PostMapping("/logout")

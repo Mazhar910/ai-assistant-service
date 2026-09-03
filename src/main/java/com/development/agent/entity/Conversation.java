@@ -33,11 +33,7 @@ public class Conversation {
     @Column(name = "updated_at")
     private LocalDateTime updatedAt = LocalDateTime.now();
 
-    @PreUpdate
-    protected void onUpdate() {
-        updatedAt = LocalDateTime.now();
-    }
-
+    /** Records conversation activity; {@link #updatedAt} drives recency ordering. */
     public void touch() {
         this.updatedAt = LocalDateTime.now();
     }
